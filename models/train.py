@@ -176,6 +176,7 @@ def representative_dataset_from_samples(
     image_size: int,
     sample_count: int,
     seed: int,
+    grayscale: bool = False,
 ):
     per_label: dict[str, list[SampleRecord]] = {}
     for sample in samples:
@@ -199,10 +200,11 @@ def representative_dataset_from_samples(
     selected = selected[:sample_count]
     for sample in selected:
         image_bytes = tf.io.read_file(sample.image_path)
-        # Match RGB channels and divide by 255.0 to resolve the quantization range bug
         image = tf.image.decode_image(image_bytes, channels=3, expand_animations=False)
         image = tf.image.resize(image, (image_size, image_size))
         image = tf.cast(image, tf.float32) / 255.0
+        if grayscale:
+            image = tf.image.rgb_to_grayscale(image)
         image = tf.expand_dims(image, 0)
         yield [image]
 
@@ -232,10 +234,135 @@ def build_model(architecture: str, input_shape: tuple[int, int, int], num_classe
         x = tf.keras.layers.Activation("relu")(x)
 
         x = tf.keras.layers.GlobalAveragePooling2D()(x)
-        outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+        logits = tf.keras.layers.Dense(num_classes, name="logits")(x)
+        outputs = tf.keras.layers.Activation("softmax", name="softmax")(logits)
         return tf.keras.Model(inputs, outputs, name="smart_pantry_micro_cnn")
     
     raise ValueError(f"Unknown architecture: {architecture}")
+
+
+def build_teacher_model(input_shape: tuple[int, int, int], num_classes: int, width_multiplier: float, pretrained: bool) -> tf.keras.Model:
+    inputs = tf.keras.Input(shape=input_shape)
+    base_model = tf.keras.applications.MobileNetV2(
+        include_top=False,
+        weights="imagenet" if pretrained else None,
+        input_shape=input_shape,
+        alpha=width_multiplier,
+        pooling=None,
+    )
+    base_model._name = "mobilenetv2_backbone"
+    base_model.trainable = False  # Freeze feature extractor initially
+    x = tf.keras.applications.mobilenet_v2.preprocess_input(inputs * 255.0)
+    x = base_model(x)
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dropout(0.2)(x)
+    logits = tf.keras.layers.Dense(num_classes, name="logits")(x)
+    outputs = tf.keras.layers.Activation("softmax", name="softmax")(logits)
+    return tf.keras.Model(inputs, outputs, name="smart_pantry_teacher_mobilenetv2")
+
+
+class Distiller(tf.keras.Model):
+    def __init__(self, student, teacher, temperature=3.0, alpha=0.5):
+        super().__init__()
+        self.student = student
+        self.teacher = teacher
+        self.temperature = temperature
+        self.alpha = alpha
+        
+        # Create helper sub-models to extract logits and softmax outputs simultaneously
+        self.student_train_model = tf.keras.Model(
+            inputs=self.student.inputs,
+            outputs=[self.student.get_layer("logits").output, self.student.output]
+        )
+        self.teacher_train_model = tf.keras.Model(
+            inputs=self.teacher.inputs,
+            outputs=[self.teacher.get_layer("logits").output, self.teacher.output]
+        )
+
+    def compile(self, optimizer, metrics, student_loss_fn):
+        super().compile(optimizer=optimizer, metrics=metrics)
+        self.student_loss_fn = student_loss_fn
+        self.student_loss_tracker = tf.keras.metrics.Mean(name="student_loss")
+        self.distillation_loss_tracker = tf.keras.metrics.Mean(name="distillation_loss")
+
+    @property
+    def metrics(self):
+        return super().metrics + [self.student_loss_tracker, self.distillation_loss_tracker]
+
+    def train_step(self, data):
+        if len(data) == 3:
+            x, y, sample_weight = data
+        else:
+            x, y = data
+            sample_weight = None
+
+        teacher_input = x
+        student_input = tf.image.rgb_to_grayscale(x)
+
+        # Forward pass of teacher
+        teacher_logits, teacher_predictions = self.teacher_train_model(teacher_input, training=False)
+
+        with tf.GradientTape() as tape:
+            student_logits, student_predictions = self.student_train_model(student_input, training=True)
+
+            student_loss = self.student_loss_fn(y, student_predictions, sample_weight=sample_weight)
+            
+            # KL divergence distillation loss (on softened logits!)
+            distillation_loss = tf.keras.losses.kl_divergence(
+                tf.nn.softmax(teacher_logits / self.temperature, axis=-1),
+                tf.nn.softmax(student_logits / self.temperature, axis=-1)
+            )
+
+            if sample_weight is not None:
+                distillation_loss = distillation_loss * tf.cast(sample_weight, distillation_loss.dtype)
+
+            total_loss = (self.alpha * student_loss) + ((1.0 - self.alpha) * (self.temperature ** 2) * tf.reduce_mean(distillation_loss))
+
+        gradients = tape.gradient(total_loss, self.student.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.student.trainable_variables))
+
+        # Update metrics
+        self.compiled_metrics.update_state(y, student_predictions)
+        self.student_loss_tracker.update_state(student_loss)
+        self.distillation_loss_tracker.update_state(distillation_loss)
+
+        results = {m.name: m.result() for m in self.metrics}
+        return results
+
+    def test_step(self, data):
+        if len(data) == 3:
+            x, y, sample_weight = data
+        else:
+            x, y = data
+            sample_weight = None
+
+        student_input = tf.image.rgb_to_grayscale(x)
+        student_predictions = self.student(student_input, training=False)
+
+        student_loss = self.student_loss_fn(y, student_predictions, sample_weight=sample_weight)
+
+        # Update metrics
+        self.compiled_metrics.update_state(y, student_predictions)
+        self.student_loss_tracker.update_state(student_loss)
+
+        results = {m.name: m.result() for m in self.metrics}
+        return results
+
+
+class StudentCheckpoint(tf.keras.callbacks.Callback):
+    def __init__(self, filepath, student_model):
+        super().__init__()
+        self.filepath = filepath
+        self.student_model = student_model
+        self.best_val_acc = -1.0
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        val_acc = logs.get("val_accuracy")
+        if val_acc is not None and val_acc > self.best_val_acc:
+            self.best_val_acc = val_acc
+            self.student_model.save(self.filepath)
+            print(f"\nSaved best student model to {self.filepath} with val_accuracy: {val_acc:.4f}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -254,6 +381,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True, help="Use ImageNet pretrained weights for MobileNetV2.")
     parser.add_argument("--fine-tune-epochs", type=int, default=8, help="Additional epochs after unfreezing the backbone.")
     parser.add_argument("--fine-tune-layers", type=int, default=40, help="Number of MobileNetV2 layers to unfreeze during fine-tuning.")
+    
+    # Grayscale & Distillation Arguments
+    parser.add_argument("--grayscale", action=argparse.BooleanOptionalAction, default=False, help="Train a grayscale model.")
+    parser.add_argument("--distill", action=argparse.BooleanOptionalAction, default=False, help="Train using knowledge distillation.")
+    parser.add_argument("--teacher-epochs", type=int, default=12, help="Number of epochs to train the teacher model.")
+    parser.add_argument("--temperature", type=float, default=3.0, help="Temperature for distillation.")
+    parser.add_argument("--alpha", type=float, default=0.5, help="Alpha weight for distillation loss (weight for student CE loss).")
+
     parser.add_argument("--qat", action=argparse.BooleanOptionalAction, default=False, help="Run quantization-aware training after float training.")
     parser.add_argument("--qat-from", type=Path, default=None, help="Optional path to a pretrained float Keras model for QAT-only runs.")
     parser.add_argument("--qat-epochs", type=int, default=6, help="QAT epochs (default: 6).")
@@ -290,6 +425,9 @@ def main() -> int:
         class_names = sorted({sample.label for sample in samples})
 
     train_samples, val_samples = split_samples(samples, args.validation_split, args.seed)
+    
+    # We load datasets as RGB. In non-distill modes, if grayscale is True, we will map them.
+    # In distill mode, distiller handles grayscale mapping inside train_step/test_step.
     normalize_to_unit = args.architecture in {"cnn", "micro_cnn"}
     train_ds = build_dataset(
         train_samples,
@@ -311,17 +449,13 @@ def main() -> int:
     )
     weights = class_weight_map(train_samples, class_names)
 
-    # REFACTOR: Swapped extensions to .h5 for stable serialization with legacy Keras
     checkpoint_path = args.output_dir / "best_model.h5"
     final_model_path = args.output_dir / "final_model.h5"
     qat_checkpoint_path = args.output_dir / "qat_best_model.h5"
     qat_final_model_path = args.output_dir / "qat_final_model.h5"
 
-    callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(str(checkpoint_path), monitor="val_accuracy", save_best_only=True),
-        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_accuracy", factor=0.5, patience=4, min_lr=1e-5),
-        tf.keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=8, restore_best_weights=True),
-    ]
+    grayscale = args.grayscale or args.distill
+    num_channels = 1 if grayscale else 3
 
     history_parts: list[dict[str, list[float]]] = []
     best_model_output = None
@@ -338,50 +472,112 @@ def main() -> int:
         best_model_output = str(args.qat_from.resolve())
         final_model_output = str(args.qat_from.resolve())
     else:
-        # Changed input shape channel argument to 3 to support RGB
-        model = build_model(args.architecture, (args.image_size, args.image_size, 3), len(class_names), args.width_multiplier, pretrained=args.pretrained)
-        model.compile(
-            optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=1e-3),
-            loss=tf.keras.losses.SparseCategoricalCrossentropy(),
-            metrics=["accuracy"],
-        )
-
-        history = model.fit(
-            train_ds,
-            validation_data=val_ds,
-            epochs=args.epochs,
-            callbacks=callbacks,
-            class_weight=weights,
-        )
-        history_parts.append(history.history)
-
-        if args.architecture == "mobilenetv2" and args.pretrained and args.fine_tune_epochs > 0:
-            base_model = model.get_layer("mobilenetv2_backbone")
-            base_model.trainable = True
-            freeze_until = max(0, len(base_model.layers) - args.fine_tune_layers)
-            for layer in base_model.layers[:freeze_until]:
-                layer.trainable = False
-            for layer in base_model.layers[freeze_until:]:
-                if isinstance(layer, tf.keras.layers.BatchNormalization):
-                    layer.trainable = False
-
-            model.compile(
-                optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=1e-5),
+        if args.distill:
+            # Distillation Workflow
+            # 1. Train/fine-tune teacher model on RGB
+            teacher_model = build_teacher_model((args.image_size, args.image_size, 3), len(class_names), args.width_multiplier, pretrained=args.pretrained)
+            teacher_model.compile(
+                optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=1e-3),
                 loss=tf.keras.losses.SparseCategoricalCrossentropy(),
                 metrics=["accuracy"],
             )
-            fine_tune_history = model.fit(
+            print("=== Training Teacher Model (MobileNetV2 RGB) ===")
+            teacher_model.fit(
                 train_ds,
                 validation_data=val_ds,
-                epochs=args.fine_tune_epochs,
+                epochs=args.teacher_epochs,
+                class_weight=weights,
+            )
+
+            # Optional: fine-tune teacher
+            if args.pretrained and args.fine_tune_epochs > 0:
+                print("=== Fine-tuning Teacher Model ===")
+                base_model = teacher_model.get_layer("mobilenetv2_backbone")
+                base_model.trainable = True
+                freeze_until = max(0, len(base_model.layers) - args.fine_tune_layers)
+                for layer in base_model.layers[:freeze_until]:
+                    layer.trainable = False
+                for layer in base_model.layers[freeze_until:]:
+                    if isinstance(layer, tf.keras.layers.BatchNormalization):
+                        layer.trainable = False
+                
+                teacher_model.compile(
+                    optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=1e-5),
+                    loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                    metrics=["accuracy"],
+                )
+                teacher_model.fit(
+                    train_ds,
+                    validation_data=val_ds,
+                    epochs=args.fine_tune_epochs,
+                    class_weight=weights,
+                )
+
+            # 2. Build student model (Grayscale: 1 channel)
+            model = build_model(args.architecture, (args.image_size, args.image_size, 1), len(class_names), args.width_multiplier, pretrained=args.pretrained)
+            
+            # 3. Instantiate distiller
+            distiller = Distiller(student=model, teacher=teacher_model, temperature=args.temperature, alpha=args.alpha)
+            distiller.compile(
+                optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=1e-3),
+                metrics=["accuracy"],
+                student_loss_fn=tf.keras.losses.SparseCategoricalCrossentropy(),
+            )
+
+            distill_callbacks = [
+                StudentCheckpoint(str(checkpoint_path), model),
+                tf.keras.callbacks.ReduceLROnPlateau(monitor="val_accuracy", factor=0.5, patience=4, min_lr=1e-5),
+                tf.keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=8, restore_best_weights=True),
+            ]
+
+            print("=== Training Student Model via Knowledge Distillation (Grayscale) ===")
+            history = distiller.fit(
+                train_ds,
+                validation_data=val_ds,
+                epochs=args.epochs,
+                callbacks=distill_callbacks,
+                class_weight=weights,
+            )
+            history_parts.append(history.history)
+            model.save(str(final_model_path))
+            best_model_output = str(checkpoint_path.resolve())
+            final_model_output = str(final_model_path.resolve())
+
+        else:
+            # Native Workflow
+            if grayscale:
+                # Map datasets to grayscale
+                train_ds_native = train_ds.map(lambda x, y: (tf.image.rgb_to_grayscale(x), y), num_parallel_calls=AUTOTUNE)
+                val_ds_native = val_ds.map(lambda x, y: (tf.image.rgb_to_grayscale(x), y), num_parallel_calls=AUTOTUNE)
+            else:
+                train_ds_native = train_ds
+                val_ds_native = val_ds
+
+            model = build_model(args.architecture, (args.image_size, args.image_size, num_channels), len(class_names), args.width_multiplier, pretrained=args.pretrained)
+            model.compile(
+                optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=1e-3),
+                loss=tf.keras.losses.SparseCategoricalCrossentropy(),
+                metrics=["accuracy"],
+            )
+
+            callbacks = [
+                tf.keras.callbacks.ModelCheckpoint(str(checkpoint_path), monitor="val_accuracy", save_best_only=True),
+                tf.keras.callbacks.ReduceLROnPlateau(monitor="val_accuracy", factor=0.5, patience=4, min_lr=1e-5),
+                tf.keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=8, restore_best_weights=True),
+            ]
+
+            print("=== Training Native Model ===")
+            history = model.fit(
+                train_ds_native,
+                validation_data=val_ds_native,
+                epochs=args.epochs,
                 callbacks=callbacks,
                 class_weight=weights,
             )
-            history_parts.append(fine_tune_history.history)
-
-        model.save(str(final_model_path))
-        best_model_output = str(checkpoint_path.resolve())
-        final_model_output = str(final_model_path.resolve())
+            history_parts.append(history.history)
+            model.save(str(final_model_path))
+            best_model_output = str(checkpoint_path.resolve())
+            final_model_output = str(final_model_path.resolve())
 
     qat_best_model = None
     qat_final_model = None
@@ -411,15 +607,26 @@ def main() -> int:
             loss=tf.keras.losses.SparseCategoricalCrossentropy(),
             metrics=["accuracy"],
         )
+        
+        # Make sure QAT dataset has correct channels
+        if grayscale:
+            train_ds_qat = train_ds.map(lambda x, y: (tf.image.rgb_to_grayscale(x), y), num_parallel_calls=AUTOTUNE)
+            val_ds_qat = val_ds.map(lambda x, y: (tf.image.rgb_to_grayscale(x), y), num_parallel_calls=AUTOTUNE)
+        else:
+            train_ds_qat = train_ds
+            val_ds_qat = val_ds
+
+        print("=== Fine-tuning with QAT ===")
         qat_history = qat_model.fit(
-            train_ds,
-            validation_data=val_ds,
+            train_ds_qat,
+            validation_data=val_ds_qat,
             epochs=args.qat_epochs,
             callbacks=qat_callbacks,
             class_weight=weights,
         )
         history_parts.append({f"qat_{k}": v for k, v in qat_history.history.items()})
         qat_model.save(str(qat_final_model_path))
+        
         qat_tflite_path = args.output_dir / "qat_model.tflite"
         qat_converter = tf.lite.TFLiteConverter.from_keras_model(qat_model)
         qat_converter.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -428,6 +635,7 @@ def main() -> int:
             args.image_size,
             min(240, len(train_samples)),
             args.seed,
+            grayscale=grayscale,
         )
         qat_converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
         qat_converter.inference_input_type = tf.int8
