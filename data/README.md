@@ -46,10 +46,14 @@ We provide a helper to fetch a subset of Food-101 into the local folder layout u
     python3 data/download_food101.py --output-dir data/source_root --classes apple_pie,pizza,cheesecake --max-per-class 1000
     ```
 
-3) After you have a `source_root` with one folder per class, create a JSONL manifest:
+3) After you have a source root with one folder per class, create a JSONL manifest:
     ```bash
-    python3 data/assemble_dataset.py --source-root data/source_root --output-manifest artifacts/manifest.jsonl
+    python3 data/assemble_dataset.py --source-root artifacts/food101_full --output-manifest artifacts/manifest.jsonl
     ```
+
+Important:
+- Keep source root and manifest aligned. If you download into artifacts/food101_full, build the manifest from artifacts/food101_full.
+- A stale manifest pointing to an older folder (for example data/source_root) will train/evaluate on the wrong dataset size.
 
 The manifest is a newline-delimited JSON (JSONL) file where each line represents a single example:
 
@@ -57,7 +61,11 @@ The manifest is a newline-delimited JSON (JSONL) file where each line represents
 { "image_path": "/abs/path/to/image.jpg", "canonical_label": "apple_pie", "source_label": "apple_pie", "source_root": "/abs/path/to/source_root" }
 ```
 
-Training and conversion scripts can either consume the folder layout directly (see `models/train.py`) or read the manifest created above depending on your workflow. The manifest provides a simple, reproducible index of images and canonical labels used for experiments.
+The training and evaluation workflow in this project uses the manifest directly:
+- train: models/train.py --manifest artifacts/manifest.jsonl
+- eval: tools/evaluate_tflite.py --manifest artifacts/manifest.jsonl
+
+The manifest provides a simple, reproducible index of images and canonical labels used for experiments.
 
 ## Scope note
 

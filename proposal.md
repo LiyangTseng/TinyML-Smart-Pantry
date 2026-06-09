@@ -1,6 +1,10 @@
 # TinyML Smart Pantry & Waste Reducer
 Miles Chin (2577815), Daniel Tseng (2577912)
 
+> Historical proposal document.
+> Some assumptions here are superseded by the implemented workflow.
+> Use README.md and src/mcu/README.md for current commands and deployment steps.
+
 ## 1. Problem Statement
 ### What problem are you solving?
 Food waste is a significant global issue, with much of it occurring at the consumer level due

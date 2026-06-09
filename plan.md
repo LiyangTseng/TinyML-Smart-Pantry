@@ -1,5 +1,8 @@
 # Implementation Plan — TinyML Smart Pantry & Waste Reducer
 
+> Historical planning document.
+> For the current reproducible workflow (micro_cnn training, TFLite eval, model_data.h export, and Arduino setup), use README.md and src/mcu/README.md.
+
 Last updated: 2026-05-30
 
 This plan translates the research findings into a phased, actionable implementation roadmap. It defines architecture, engineering trade-offs, exact repository locations for artifacts, conceptual code snippets, evaluation plans, and a granular TODO list broken into phases.

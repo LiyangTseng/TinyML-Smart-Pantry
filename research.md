@@ -1,5 +1,8 @@
 # TinyML Smart Pantry & Waste Reducer — Research Notes
 
+> Historical research and design notes.
+> For current executable workflow and deployment instructions, use README.md and src/mcu/README.md.
+
 Authors: Miles Chin (2577815), Daniel Tseng (2577912)
 
 Last updated: 2026-05-30
