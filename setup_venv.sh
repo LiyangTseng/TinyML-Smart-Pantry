@@ -47,7 +47,10 @@ To activate locally:
   source .venv/bin/activate
 
 Then run commands normally, e.g.:
-  python3 data/download_food101.py --output-dir data/source_root --max-per-class 250
+  python data/download_food101.py \
+  --output-dir artifacts/food101_full \
+  --label-map data/label_map.json \
+  --max-per-class 1000
 
 To remove the virtualenv:
   rm -rf .venv

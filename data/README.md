@@ -35,12 +35,15 @@ We provide a helper to fetch a subset of Food-101 into the local folder layout u
 
 1) Download a subset of Food-101 (defaults to the dish labels in `label_map.json`):
     ```bash
-    python3 data/download_food101.py --output-dir data/source_root --max-per-class 250
+    python data/download_food101.py \
+    --output-dir artifacts/food101_full \
+    --label-map data/label_map.json \
+    --max-per-class 1000
     ```
 
 2) Alternatively specify exact canonical classes (comma-separated):
     ```bash
-    python3 data/download_food101.py --output-dir data/source_root --classes apple_pie,pizza,cheesecake --max-per-class 200
+    python3 data/download_food101.py --output-dir data/source_root --classes apple_pie,pizza,cheesecake --max-per-class 1000
     ```
 
 3) After you have a `source_root` with one folder per class, create a JSONL manifest:

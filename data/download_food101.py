@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory to write class subfolders.")
     parser.add_argument("--classes", type=str, default=None, help="Comma-separated list of canonical classes to download (defaults to data/label_map.json keys).")
     parser.add_argument("--label-map", type=Path, default=Path(__file__).with_name("label_map.json"), help="Path to the canonical-to-Food-101 label mapping JSON.")
-    parser.add_argument("--max-per-class", type=int, default=250, help="Maximum images to download per class.")
+    parser.add_argument("--max-per-class", type=int, default=1000, help="Maximum images to download per class (Food-101 max is 1000 across train+validation).")
     return parser.parse_args()
 
 
@@ -95,6 +95,12 @@ def main() -> int:
     args = parse_args()
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.max_per_class <= 0:
+        raise SystemExit("--max-per-class must be a positive integer")
+    if args.max_per_class > 1000:
+        print("WARNING: Food-101 provides at most 1000 images per class in train+validation. Clamping to 1000.")
+        args.max_per_class = 1000
 
     try:
         tf.config.threading.set_inter_op_parallelism_threads(1)

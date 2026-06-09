@@ -120,15 +120,34 @@ def build_dataset(
 
     def load_and_preprocess(path: tf.Tensor, label: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
         image_bytes = tf.io.read_file(path)
-        image = tf.image.decode_image(image_bytes, channels=3, expand_animations=False)
+        # OPTIMIZATION 1: Changed channels to 1 (Grayscale)
+        image = tf.image.decode_image(image_bytes, channels=1, expand_animations=False)
         image = tf.image.resize(image, (image_size, image_size))
         image = tf.cast(image, tf.float32)
+        
         if normalize_to_unit:
             image = image / 255.0
+            
         if augment and training:
+            # --- Spatial / Geometric Augmentations ---
             image = tf.image.random_flip_left_right(image)
-            image = tf.image.random_brightness(image, max_delta=0.08)
-            image = tf.image.random_contrast(image, lower=0.85, upper=1.15)
+            
+            scales = tf.random.uniform([], 0.85, 1.0)
+            boxes = tf.stack([
+                (1.0 - scales) / 2.0, (1.0 - scales) / 2.0,
+                (1.0 + scales) / 2.0, (1.0 + scales) / 2.0
+            ])
+            image = tf.image.crop_and_resize(
+                tf.expand_dims(image, 0), 
+                tf.expand_dims(boxes, 0), 
+                box_indices=[0], 
+                crop_size=(image_size, image_size)
+            )[0]
+
+            # --- Color / Lighting Augmentations ---
+            image = tf.image.random_brightness(image, max_delta=0.12)
+            image = tf.image.random_contrast(image, lower=0.80, upper=1.20)
+            
         return image, label
 
     dataset = path_ds.map(load_and_preprocess, num_parallel_calls=AUTOTUNE)
@@ -148,20 +167,6 @@ def class_weight_map(train_samples: list[SampleRecord], class_names: list[str]) 
             continue
         weights[index] = total / (num_classes * count)
     return weights
-
-
-def separable_block(x: tf.Tensor, filters: int, stride: int, name: str) -> tf.Tensor:
-    x = tf.keras.layers.SeparableConv2D(
-        filters,
-        3,
-        strides=stride,
-        padding="same",
-        use_bias=False,
-        name=f"{name}_sepconv",
-    )(x)
-    x = tf.keras.layers.BatchNormalization(name=f"{name}_bn")(x)
-    x = tf.keras.layers.Activation("relu", name=f"{name}_relu")(x)
-    return x
 
 
 def representative_dataset_from_samples(
@@ -192,7 +197,8 @@ def representative_dataset_from_samples(
     selected = selected[:sample_count]
     for sample in selected:
         image_bytes = tf.io.read_file(sample.image_path)
-        image = tf.image.decode_image(image_bytes, channels=3, expand_animations=False)
+        # OPTIMIZATION 1: Match full pipeline quantization setup to 1 channel
+        image = tf.image.decode_image(image_bytes, channels=1, expand_animations=False)
         image = tf.image.resize(image, (image_size, image_size))
         image = tf.cast(image, tf.float32)
         image = tf.expand_dims(image, 0)
@@ -201,61 +207,26 @@ def representative_dataset_from_samples(
 
 def build_model(architecture: str, input_shape: tuple[int, int, int], num_classes: int, width_multiplier: float, pretrained: bool) -> tf.keras.Model:
     inputs = tf.keras.Input(shape=input_shape)
-    x = tf.keras.layers.Rescaling(1.0 / 255.0)(inputs)
-    x = tf.keras.layers.RandomFlip("horizontal", name="aug_flip")(x)
-    x = tf.keras.layers.RandomRotation(0.12, name="aug_rot")(x)
-    x = tf.keras.layers.RandomZoom(0.12, name="aug_zoom")(x)
-    x = tf.keras.layers.RandomContrast(0.15, name="aug_contrast")(x)
-
-    if architecture == "mobilenetv2":
-        base_model = tf.keras.applications.MobileNetV2(
-            include_top=False,
-            weights="imagenet" if pretrained else None,
-            input_shape=input_shape,
-            alpha=width_multiplier,
-            pooling=None,
-            name="mobilenetv2_backbone",
-        )
-        base_model.trainable = not pretrained
-        x = tf.keras.applications.mobilenet_v2.preprocess_input(x * 255.0)
-        x = base_model(x)
-        x = tf.keras.layers.GlobalAveragePooling2D()(x)
-        x = tf.keras.layers.Dropout(0.2)(x)
-        outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
-        return tf.keras.Model(inputs, outputs, name="smart_pantry_mobilenetv2")
-
-    if architecture == "cnn":
+    
+    if architecture == "micro_cnn":
         x = inputs
         x = tf.keras.layers.Conv2D(16, 3, padding="same", activation="relu")(x)
         x = tf.keras.layers.MaxPooling2D()(x)
+
         x = tf.keras.layers.Conv2D(32, 3, padding="same", activation="relu")(x)
         x = tf.keras.layers.MaxPooling2D()(x)
-        x = tf.keras.layers.Conv2D(64, 3, padding="same", activation="relu")(x)
-        x = tf.keras.layers.GlobalAveragePooling2D()(x)
+
+        x = tf.keras.layers.Conv2D(48, 3, padding="same", activation="relu")(x)
+        x = tf.keras.layers.MaxPooling2D()(x)
+
+        # OPTIMIZATION 2: Swapped GAP out for a Flatten + Dense hidden classification head
+        x = tf.keras.layers.Flatten()(x)
+        x = tf.keras.layers.Dense(32, activation="relu")(x)
         x = tf.keras.layers.Dropout(0.2)(x)
         outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
-        return tf.keras.Model(inputs, outputs, name="smart_pantry_cnn")
-
-    if architecture == "separable_cnn":
-        x = inputs
-        x = tf.keras.layers.Conv2D(32, 3, strides=2, padding="same", use_bias=False, name="stem_conv")(x)
-        x = tf.keras.layers.BatchNormalization(name="stem_bn")(x)
-        x = tf.keras.layers.Activation("relu", name="stem_relu")(x)
-
-        x = separable_block(x, 48, 1, "block1")
-        x = tf.keras.layers.MaxPooling2D(pool_size=2, name="block1_pool")(x)
-        x = separable_block(x, 64, 1, "block2")
-        x = tf.keras.layers.MaxPooling2D(pool_size=2, name="block2_pool")(x)
-        x = separable_block(x, 96, 1, "block3")
-        x = separable_block(x, 128, 1, "block4")
-        x = tf.keras.layers.Dropout(0.25, name="sep_dropout")(x)
-        x = tf.keras.layers.GlobalAveragePooling2D(name="sep_gap")(x)
-        x = tf.keras.layers.Dense(64, activation="relu", name="sep_head_dense")(x)
-        x = tf.keras.layers.Dropout(0.25, name="sep_head_dropout")(x)
-        outputs = tf.keras.layers.Dense(num_classes, activation="softmax", name="sep_logits")(x)
-        return tf.keras.Model(inputs, outputs, name="smart_pantry_separable_cnn")
-
-    raise ValueError(f"unknown architecture: {architecture}")
+        return tf.keras.Model(inputs, outputs, name="smart_pantry_micro_cnn")
+    
+    raise ValueError(f"Unknown architecture: {architecture}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -264,7 +235,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, default=None, help="JSONL manifest generated by data/assemble_dataset.py.")
     parser.add_argument("--class-map", type=Path, default=Path(__file__).resolve().parents[1] / "data" / "label_map.json", help="JSON file defining the class order.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for checkpoints and exported artifacts.")
-    parser.add_argument("--architecture", choices=("mobilenetv2", "cnn", "separable_cnn"), default="mobilenetv2")
+    parser.add_argument("--architecture", choices=("mobilenetv2", "cnn", "micro_cnn", "separable_cnn"), default="micro_cnn")
     parser.add_argument("--image-size", type=int, default=96)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=25)
@@ -310,7 +281,7 @@ def main() -> int:
         class_names = sorted({sample.label for sample in samples})
 
     train_samples, val_samples = split_samples(samples, args.validation_split, args.seed)
-    normalize_to_unit = args.architecture in {"cnn", "separable_cnn"}
+    normalize_to_unit = args.architecture in {"cnn", "micro_cnn"}
     train_ds = build_dataset(
         train_samples,
         class_names,
@@ -318,7 +289,7 @@ def main() -> int:
         args.batch_size,
         training=True,
         normalize_to_unit=normalize_to_unit,
-        augment=args.architecture == "separable_cnn",
+        augment=args.architecture in {"cnn", "micro_cnn"},
     )
     val_ds = build_dataset(
         val_samples,
@@ -331,10 +302,11 @@ def main() -> int:
     )
     weights = class_weight_map(train_samples, class_names)
 
-    checkpoint_path = args.output_dir / "best_model.keras"
-    final_model_path = args.output_dir / "final_model.keras"
-    qat_checkpoint_path = args.output_dir / "qat_best_model.keras"
-    qat_final_model_path = args.output_dir / "qat_final_model.keras"
+    # REFACTOR: Swapped extensions to .h5 for stable serialization with legacy Keras
+    checkpoint_path = args.output_dir / "best_model.h5"
+    final_model_path = args.output_dir / "final_model.h5"
+    qat_checkpoint_path = args.output_dir / "qat_best_model.h5"
+    qat_final_model_path = args.output_dir / "qat_final_model.h5"
 
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(str(checkpoint_path), monitor="val_accuracy", save_best_only=True),
@@ -357,9 +329,10 @@ def main() -> int:
         best_model_output = str(args.qat_from.resolve())
         final_model_output = str(args.qat_from.resolve())
     else:
-        model = build_model(args.architecture, (args.image_size, args.image_size, 3), len(class_names), args.width_multiplier, pretrained=args.pretrained)
+        # OPTIMIZATION 1: Changed input shape channel argument from 3 to 1
+        model = build_model(args.architecture, (args.image_size, args.image_size, 1), len(class_names), args.width_multiplier, pretrained=args.pretrained)
         model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+            optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=1e-3),
             loss=tf.keras.losses.SparseCategoricalCrossentropy(),
             metrics=["accuracy"],
         )
@@ -384,7 +357,7 @@ def main() -> int:
                     layer.trainable = False
 
             model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+                optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=1e-5),
                 loss=tf.keras.losses.SparseCategoricalCrossentropy(),
                 metrics=["accuracy"],
             )
@@ -412,7 +385,7 @@ def main() -> int:
         if nested_models:
             raise SystemExit(
                 "QAT is not supported for models with nested submodels in this pipeline "
-                f"(found: {nested_models}). Use --architecture cnn for QAT runs."
+                f"(found: {nested_models}). Use --architecture cnn or micro_cnn for QAT runs."
             )
         try:
             qat_model = quantize_model(model)
@@ -425,7 +398,7 @@ def main() -> int:
             tf.keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=4, restore_best_weights=True),
         ]
         qat_model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=args.qat_learning_rate),
+            optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=args.qat_learning_rate),
             loss=tf.keras.losses.SparseCategoricalCrossentropy(),
             metrics=["accuracy"],
         )

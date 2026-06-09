@@ -76,6 +76,28 @@ def dequantize_output(q, scale, zero_point):
     return (q.astype(np.float32) - zero_point) * scale
 
 
+def preprocess_image_for_model(img_path, image_size, input_shape):
+    # TFLite uses NHWC for image models. We adapt channels to model expectation.
+    if len(input_shape) != 4:
+        raise ValueError(f'Expected rank-4 input tensor, got shape: {input_shape}')
+
+    expected_channels = int(input_shape[3])
+    if expected_channels == 1:
+        img = Image.open(img_path).convert('L').resize((image_size, image_size))
+        x = np.array(img).astype(np.float32)
+        x = np.expand_dims(x, axis=-1)
+    elif expected_channels == 3:
+        img = Image.open(img_path).convert('RGB').resize((image_size, image_size))
+        x = np.array(img).astype(np.float32)
+    else:
+        raise ValueError(
+            f'Unsupported input channel count in model: {expected_channels}. '
+            'Expected 1 or 3.'
+        )
+
+    return np.expand_dims(x, 0)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--tflite', required=True)
@@ -134,6 +156,7 @@ def main():
 
     print('TFLite input dtype', inp_dtype, 'quant', inp_q)
     print('TFLite output dtype', out_dtype, 'quant', out_q)
+    print('TFLite input shape', tuple(input_details.get('shape', [])))
 
     if args.input_mode == 'auto':
         # Heuristic: int8 input with scale near 1 usually means 0..255 domain.
@@ -147,15 +170,14 @@ def main():
 
     correct = 0
     total = 0
+    input_shape = tuple(input_details.get('shape', []))
     for r in val:
         img_path = Path(r['image_path'])
         if not img_path.exists():
             continue
-        img = Image.open(img_path).convert('RGB').resize((args.image_size, args.image_size))
-        x = np.array(img).astype(np.float32)
+        x = preprocess_image_for_model(img_path, args.image_size, input_shape)
         if effective_input_mode == 'zero_one':
             x = x / 255.0
-        x = np.expand_dims(x, 0)
 
         if inp_dtype in (np.int8, np.uint8):
             qx = quantize_input(x, inp_scale if inp_scale != 0 else 1.0, int(inp_zp), inp_dtype)
