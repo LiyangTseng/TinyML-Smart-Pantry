@@ -69,7 +69,7 @@ def read_directory_samples(data_dir: Path) -> list[SampleRecord]:
     samples: list[SampleRecord] = []
     for class_dir in sorted(path for path in data_dir.iterdir() if path.is_dir()):
         for image_path in sorted(class_dir.rglob("*")):
-            if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS:
+            if image_path.is_file() and image_path.suffix.lower() in IMAGE_EXTENSIONS and not image_path.name.startswith("._"):
                 samples.append(SampleRecord(image_path=str(image_path.resolve()), label=class_dir.name))
     return samples
 
@@ -120,8 +120,8 @@ def build_dataset(
 
     def load_and_preprocess(path: tf.Tensor, label: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
         image_bytes = tf.io.read_file(path)
-        # OPTIMIZATION 1: Changed channels to 1 (Grayscale)
-        image = tf.image.decode_image(image_bytes, channels=1, expand_animations=False)
+        # Decoding as 3 channels (RGB) to retain color features
+        image = tf.image.decode_image(image_bytes, channels=3, expand_animations=False)
         image = tf.image.resize(image, (image_size, image_size))
         image = tf.cast(image, tf.float32)
         
@@ -147,6 +147,8 @@ def build_dataset(
             # --- Color / Lighting Augmentations ---
             image = tf.image.random_brightness(image, max_delta=0.12)
             image = tf.image.random_contrast(image, lower=0.80, upper=1.20)
+            # Clip pixel values to [0.0, 1.0] to prevent out-of-bounds training data
+            image = tf.clip_by_value(image, 0.0, 1.0)
             
         return image, label
 
@@ -197,10 +199,10 @@ def representative_dataset_from_samples(
     selected = selected[:sample_count]
     for sample in selected:
         image_bytes = tf.io.read_file(sample.image_path)
-        # OPTIMIZATION 1: Match full pipeline quantization setup to 1 channel
-        image = tf.image.decode_image(image_bytes, channels=1, expand_animations=False)
+        # Match RGB channels and divide by 255.0 to resolve the quantization range bug
+        image = tf.image.decode_image(image_bytes, channels=3, expand_animations=False)
         image = tf.image.resize(image, (image_size, image_size))
-        image = tf.cast(image, tf.float32)
+        image = tf.cast(image, tf.float32) / 255.0
         image = tf.expand_dims(image, 0)
         yield [image]
 
@@ -210,19 +212,23 @@ def build_model(architecture: str, input_shape: tuple[int, int, int], num_classe
     
     if architecture == "micro_cnn":
         x = inputs
-        x = tf.keras.layers.Conv2D(16, 3, padding="same", activation="relu")(x)
+        # Added BatchNormalization and switched to GlobalAveragePooling2D to improve stability and drastically reduce model footprint
+        x = tf.keras.layers.Conv2D(16, 3, padding="same")(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation("relu")(x)
         x = tf.keras.layers.MaxPooling2D()(x)
 
-        x = tf.keras.layers.Conv2D(32, 3, padding="same", activation="relu")(x)
+        x = tf.keras.layers.Conv2D(32, 3, padding="same")(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation("relu")(x)
         x = tf.keras.layers.MaxPooling2D()(x)
 
-        x = tf.keras.layers.Conv2D(48, 3, padding="same", activation="relu")(x)
+        x = tf.keras.layers.Conv2D(48, 3, padding="same")(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation("relu")(x)
         x = tf.keras.layers.MaxPooling2D()(x)
 
-        # OPTIMIZATION 2: Swapped GAP out for a Flatten + Dense hidden classification head
-        x = tf.keras.layers.Flatten()(x)
-        x = tf.keras.layers.Dense(32, activation="relu")(x)
-        x = tf.keras.layers.Dropout(0.2)(x)
+        x = tf.keras.layers.GlobalAveragePooling2D()(x)
         outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
         return tf.keras.Model(inputs, outputs, name="smart_pantry_micro_cnn")
     
@@ -310,8 +316,8 @@ def main() -> int:
 
     callbacks = [
         tf.keras.callbacks.ModelCheckpoint(str(checkpoint_path), monitor="val_accuracy", save_best_only=True),
-        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_accuracy", factor=0.5, patience=2, min_lr=1e-5),
-        tf.keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=6, restore_best_weights=True),
+        tf.keras.callbacks.ReduceLROnPlateau(monitor="val_accuracy", factor=0.5, patience=4, min_lr=1e-5),
+        tf.keras.callbacks.EarlyStopping(monitor="val_accuracy", patience=8, restore_best_weights=True),
     ]
 
     history_parts: list[dict[str, list[float]]] = []
@@ -329,8 +335,8 @@ def main() -> int:
         best_model_output = str(args.qat_from.resolve())
         final_model_output = str(args.qat_from.resolve())
     else:
-        # OPTIMIZATION 1: Changed input shape channel argument from 3 to 1
-        model = build_model(args.architecture, (args.image_size, args.image_size, 1), len(class_names), args.width_multiplier, pretrained=args.pretrained)
+        # Changed input shape channel argument to 3 to support RGB
+        model = build_model(args.architecture, (args.image_size, args.image_size, 3), len(class_names), args.width_multiplier, pretrained=args.pretrained)
         model.compile(
             optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=1e-3),
             loss=tf.keras.losses.SparseCategoricalCrossentropy(),

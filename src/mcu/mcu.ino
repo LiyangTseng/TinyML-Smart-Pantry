@@ -25,7 +25,7 @@
 // ---------------------------------------------------------------------------
 static constexpr int kImgH = 96;
 static constexpr int kImgW = 96;
-static constexpr int kImgC = 1;  // Grayscale
+static constexpr int kImgC = 3;  // RGB
 
 static constexpr int kNumLabels = 6;
 static const char* const kLabels[kNumLabels] = {
@@ -81,7 +81,7 @@ static bool initModel() {
         return false;
     }
 
-    static tflite::MicroMutableOpResolver<5> resolver;
+    static tflite::MicroMutableOpResolver<7> resolver;
     static bool resolverInitialized = false;
     if (!resolverInitialized) {
         resolver.AddConv2D();
@@ -89,6 +89,8 @@ static bool initModel() {
         resolver.AddReshape();
         resolver.AddFullyConnected();
         resolver.AddSoftmax();
+        resolver.AddMean();
+        resolver.AddAveragePool2D();
         resolverInitialized = true;
     }
 
@@ -121,7 +123,7 @@ static bool initModel() {
 // ===========================================================================
 static bool initCamera() {
     initializeShield();
-    if (!Camera.begin(QQVGA, GRAYSCALE, 5, OV7675)) {
+    if (!Camera.begin(QQVGA, RGB565, 5, OV7675)) {
         Serial.println("camera_init_failed");
         return false;
     }
@@ -133,7 +135,8 @@ static bool initCamera() {
 // fillInputTensor()
 // ===========================================================================
 static bool fillInputTensor(TfLiteTensor* input) {
-    byte cameraFrame[kCaptureW * kCaptureH];
+    // RGB565 uses 2 bytes per pixel
+    byte cameraFrame[kCaptureW * kCaptureH * 2];
     Camera.readFrame(cameraFrame);
 
     const float   inScale = input->params.scale;
@@ -145,12 +148,27 @@ static bool fillInputTensor(TfLiteTensor* input) {
         for (int x = 0; x < kCaptureW; x++) {
             // Check if current camera pixel falls inside the central 96x96 box
             if (x >= 32 && x < 128 && y >= 12 && y < 108) {
-                uint8_t rawPixel = cameraFrame[y * kCaptureW + x];
+                int pixelIdx = (y * kCaptureW + x) * 2;
+                uint8_t byte1 = cameraFrame[pixelIdx];
+                uint8_t byte2 = cameraFrame[pixelIdx + 1];
+                uint16_t pixel = (byte1 << 8) | byte2;
                 
-                float normalizedPixel = static_cast<float>(rawPixel) / 255.0f;
-                int32_t q = static_cast<int32_t>(roundf(normalizedPixel / inScale) + inZP);
+                uint8_t r = ((pixel >> 11) & 0x1F);
+                uint8_t g = ((pixel >> 5) & 0x3F);
+                uint8_t b = (pixel & 0x1F);
                 
-                input->data.int8[i++] = static_cast<int8_t>(constrain(q, -128, 127));
+                // Convert to [0.0, 1.0] range
+                float r_norm = static_cast<float>((r * 255) / 31) / 255.0f;
+                float g_norm = static_cast<float>((g * 255) / 63) / 255.0f;
+                float b_norm = static_cast<float>((b * 255) / 31) / 255.0f;
+                
+                int32_t qr = static_cast<int32_t>(roundf(r_norm / inScale) + inZP);
+                int32_t qg = static_cast<int32_t>(roundf(g_norm / inScale) + inZP);
+                int32_t qb = static_cast<int32_t>(roundf(b_norm / inScale) + inZP);
+                
+                input->data.int8[i++] = static_cast<int8_t>(constrain(qr, -128, 127));
+                input->data.int8[i++] = static_cast<int8_t>(constrain(qg, -128, 127));
+                input->data.int8[i++] = static_cast<int8_t>(constrain(qb, -128, 127));
             }
         }
     }
@@ -188,8 +206,11 @@ static void visualDebugPrint(TfLiteTensor* input) {
     // Sub-sample down to a 24x24 text block so it prints quickly over Serial
     for (int y = 0; y < kImgH; y += 4) {
         for (int x = 0; x < kImgW; x += 4) {
-            int dst = y * kImgW + x;
-            int8_t pixelVal = input->data.int8[dst];
+            int dst = (y * kImgW + x) * 3;
+            int32_t r = input->data.int8[dst];
+            int32_t g = input->data.int8[dst + 1];
+            int32_t b = input->data.int8[dst + 2];
+            int32_t pixelVal = (r + g + b) / 3;
             
             // Map the INT8 ranges to ASCII characters based on brightness
             if (pixelVal < -64)       Serial.print(" ");  // Darkest

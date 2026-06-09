@@ -43,7 +43,7 @@ def load_label_map(label_map_path: Path) -> dict[str, str]:
 
 def iter_image_files(root: Path) -> Iterable[Path]:
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS and not path.name.startswith("._"):
             yield path
 
 

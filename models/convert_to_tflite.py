@@ -84,7 +84,7 @@ def load_representative_dataset_from_manifest(manifest_path: Path, image_size: i
         image_bytes = tf.io.read_file(str(image_path))
         image = tf.image.decode_image(image_bytes, channels=3, expand_animations=False)
         image = tf.image.resize(image, (image_size, image_size))
-        image = tf.cast(image, tf.float32)
+        image = tf.cast(image, tf.float32) / 255.0
         image = tf.expand_dims(image, 0)
         yield [image]
 
