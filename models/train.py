@@ -212,21 +212,24 @@ def build_model(architecture: str, input_shape: tuple[int, int, int], num_classe
     
     if architecture == "micro_cnn":
         x = inputs
-        # Added BatchNormalization and switched to GlobalAveragePooling2D to improve stability and drastically reduce model footprint
-        x = tf.keras.layers.Conv2D(16, 3, padding="same")(x)
+        # Upgraded to 4 layers (24-48-96-96 channels) for higher capacity.
+        # Strides of 2 in the first two layers keep activation RAM under 60 KB.
+        x = tf.keras.layers.Conv2D(24, 3, strides=2, padding="same")(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation("relu")(x)
+
+        x = tf.keras.layers.Conv2D(48, 3, strides=2, padding="same")(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.Activation("relu")(x)
+
+        x = tf.keras.layers.Conv2D(96, 3, strides=1, padding="same")(x)
         x = tf.keras.layers.BatchNormalization()(x)
         x = tf.keras.layers.Activation("relu")(x)
         x = tf.keras.layers.MaxPooling2D()(x)
 
-        x = tf.keras.layers.Conv2D(32, 3, padding="same")(x)
+        x = tf.keras.layers.Conv2D(96, 3, strides=1, padding="same")(x)
         x = tf.keras.layers.BatchNormalization()(x)
         x = tf.keras.layers.Activation("relu")(x)
-        x = tf.keras.layers.MaxPooling2D()(x)
-
-        x = tf.keras.layers.Conv2D(48, 3, padding="same")(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.Activation("relu")(x)
-        x = tf.keras.layers.MaxPooling2D()(x)
 
         x = tf.keras.layers.GlobalAveragePooling2D()(x)
         outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
@@ -244,7 +247,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--architecture", choices=("mobilenetv2", "cnn", "micro_cnn", "separable_cnn"), default="micro_cnn")
     parser.add_argument("--image-size", type=int, default=96)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--validation-split", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--width-multiplier", type=float, default=0.35)
