@@ -41,13 +41,17 @@ Then run training with the manifest created from the data assembly step. Adjust 
 ```bash
 python models/train.py \
   --manifest artifacts/manifest.jsonl \
-  --output-dir artifacts/model_pretrained/debug_run \
-  --architecture mobilenetv2 \
-  --epochs 6 \
-  --fine-tune-epochs 4 \
+   --output-dir artifacts/micro_cnn_qat \
+  --architecture micro_cnn \
+  --epochs 20 \
+  --fine-tune-epochs 0 \
+  --qat \
+  --qat-epochs 8 \
+  --qat-learning-rate 1e-5 \
   --batch-size 16 \
   --image-size 96 \
-  --validation-split 0.2
+  --validation-split 0.2 \
+  --seed 42
 ```
 
 ### Model quantization and TFLite conversion
@@ -76,27 +80,27 @@ Run the recommended QAT-friendly higher-accuracy pass (separable CNN path):
 ```bash
 python models/train.py \
   --manifest artifacts/manifest.jsonl \
-  --output-dir artifacts/model_sepqat2 \
+  --output-dir artifacts/sweep_b \
   --architecture separable_cnn \
   --epochs 12 \
   --fine-tune-epochs 0 \
   --qat \
   --qat-epochs 6 \
-  --qat-learning-rate 1e-5 \
+  --qat-learning-rate 5e-6 \
   --batch-size 16 \
   --image-size 96 \
   --validation-split 0.2 \
   --seed 42
 ```
 
-QAT training now emits an int8 TFLite artifact directly at `artifacts/model_sepqat2/qat_model.tflite` (or the matching output directory you pass to `--output-dir`).
+QAT training now emits an int8 TFLite artifact directly at `artifacts/sweep_b/qat_model.tflite` (or the matching output directory you pass to `--output-dir`).
 
 If you want to re-convert a compatible SavedModel manually, you can still use `models/convert_to_tflite.py`, but the default reproducible path is the direct export from `models/train.py`.
 
 Evaluate QAT int8 model:
 ```bash
 python tools/evaluate_tflite.py \
-  --tflite artifacts/model_sepqat2/qat_model.tflite \
+  --tflite artifacts/sweep_b/qat_model.tflite \
   --manifest artifacts/manifest.jsonl \
   --image-size 96 \
   --split-mode train_compatible \
